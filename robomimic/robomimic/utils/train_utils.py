@@ -741,3 +741,93 @@ def is_every_n_steps(interval, current_step, skip_zero=False):
     if skip_zero and current_step == 0:
         return False
     return current_step % interval == 0
+
+
+def infinite_dataloader(dataloader):
+    while True:
+        for batch in dataloader:
+            yield batch
+
+
+def concat_two_batch(batch1: dict, batch2: dict):
+    all_keys = list(set(list(batch1.keys()) + list(batch2.keys())))
+    final_batch = {}
+    for k in all_keys:
+        if (k in batch1) and (k in batch2):
+            if isinstance(batch1[k], dict):
+                final_batch[k] = concat_two_batch(batch1[k], batch2[k])
+            else:
+                final_batch[k] = torch.cat([batch1[k], batch2[k]], dim=0)
+        elif (k in batch1) and (k not in batch2):
+            final_batch[k] = batch1[k]
+        elif (k in batch2) and (k not in batch1):
+            final_batch[k] = batch2[k]
+        else:
+            raise NotImplementedError
+    return final_batch
+
+
+def run_epoch_for_ot_policy(model, ot_params, bc_dataloader, ot_dataloader,
+                            epoch, validate=False, num_steps=None,
+                            obs_normalization_stats=None):
+    epoch_timestamp = time.time()
+    if validate:
+        model.set_eval()
+    else:
+        model.set_train()
+
+    assert num_steps is not None
+    step_log_all = []
+    timing_stats = dict(Data_Loading=[], Process_Batch=[], Train_Batch=[],
+                        Log_Info=[])
+
+    ot_dl = infinite_dataloader(ot_dataloader)
+    bc_dl = infinite_dataloader(bc_dataloader)
+
+    for _ in LogUtils.custom_tqdm(range(num_steps)):
+        t = time.time()
+        ot_batch = next(ot_dl)
+        bc_batch = next(bc_dl)
+
+        src_ot_batch = ot_batch["src"]
+        tgt_ot_batch = ot_batch["tgt"]
+        B_ot = src_ot_batch["actions"].shape[0]
+        ot_batch = concat_two_batch(src_ot_batch, tgt_ot_batch)
+        batch = concat_two_batch(ot_batch, bc_batch)
+        timing_stats["Data_Loading"].append(time.time() - t)
+
+        t = time.time()
+        input_batch = model.process_batch_for_training(batch, B_ot)
+        input_batch = model.postprocess_batch_for_training(
+            input_batch, obs_normalization_stats=obs_normalization_stats
+        )
+        timing_stats["Process_Batch"].append(time.time() - t)
+
+        t = time.time()
+        info = model.train_on_batch(
+            input_batch, B_ot, ot_params, epoch, validate=validate
+        )
+        timing_stats["Train_Batch"].append(time.time() - t)
+        model.on_gradient_step()
+
+        t = time.time()
+        step_log = model.log_info(info)
+        step_log_all.append(step_log)
+        timing_stats["Log_Info"].append(time.time() - t)
+
+    step_log_dict = {}
+    for i in range(len(step_log_all)):
+        for k in step_log_all[i]:
+            if k not in step_log_dict:
+                step_log_dict[k] = []
+            step_log_dict[k].append(step_log_all[i][k])
+    pi = step_log_dict.pop("pi", None)
+    step_log_all = dict((k, float(np.mean(v))) for k, v in step_log_dict.items())
+
+    for k in timing_stats:
+        step_log_all["Time_{}".format(k)] = np.sum(timing_stats[k]) / 60.
+    step_log_all["Time_Epoch"] = (time.time() - epoch_timestamp) / 60.
+    if pi is not None:
+        step_log_all["pi"] = pi[-1]
+
+    return step_log_all
