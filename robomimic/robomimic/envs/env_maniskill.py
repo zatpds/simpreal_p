@@ -193,6 +193,19 @@ class EnvManiSkill(EB.EnvBase):
         self._current_reward = None
         self._current_info = {}
 
+        # Replicate robosuite's PandaGripper.format_action() behaviour:
+        # only the SIGN of the predicted gripper action matters; the
+        # internal state integrates at a fixed speed and is sent directly
+        # to ManiSkill's position controller.  This prevents noisy
+        # diffusion-policy predictions from slamming the gripper open/
+        # closed every step (which the PD position controller cannot
+        # track, causing the cube to drop).  Robosuite uses speed=0.2;
+        # we use 0.4 for slightly faster transitions since ManiSkill
+        # training data has instantaneous binary grip changes.
+        self._grip_state = 1.0   # integrated gripper, +1 = open
+        _GRIP_SPEED = 0.4
+        self._grip_speed = _GRIP_SPEED
+
     # ------------------------------------------------------------------
     #  Core API
     # ------------------------------------------------------------------
@@ -211,7 +224,13 @@ class EnvManiSkill(EB.EnvBase):
         # Inverse of −90° around Z is +90° around Z → transpose of _R_MS2RS
         action[:3] = action[:3] @ _R_MS2RS  # inverse rotation for delta pos
         action[3:6] = action[3:6] @ _R_MS2RS  # inverse rotation for delta rot
-        # gripper (action[6]) is unchanged
+
+        # Robosuite-style gripper: integrate sign at fixed speed.
+        self._grip_state = np.clip(
+            self._grip_state + np.sign(action[6]) * self._grip_speed,
+            -1.0, 1.0,
+        )
+        action[6] = self._grip_state
 
         obs_raw, reward, terminated, truncated, info = self.env.step(action.astype(np.float32))
         self._current_obs_raw = obs_raw
@@ -226,6 +245,7 @@ class EnvManiSkill(EB.EnvBase):
 
     def reset(self):
         """Reset the environment, return initial observation."""
+        self._grip_state = 1.0  # reset integrator (start open)
         obs_raw, info = self.env.reset()
         self._current_obs_raw = obs_raw
         self._current_reward = 0.0

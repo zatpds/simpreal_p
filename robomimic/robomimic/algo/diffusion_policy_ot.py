@@ -52,11 +52,12 @@ def algo_config_to_class(algo_config):
 
 
 class OTDiffusionPolicyUNet(PolicyAlgo):
+    _debug_step = 0
+
     def _create_networks(self):
         """
         Creates networks and places them into @self.nets.
         """
-        # set up different observation groups for @MIMO_MLP
         observation_group_shapes = OrderedDict()
         observation_group_shapes["obs"] = OrderedDict(self.obs_shapes)
         encoder_kwargs = ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder)
@@ -65,20 +66,15 @@ class OTDiffusionPolicyUNet(PolicyAlgo):
             observation_group_shapes=observation_group_shapes,
             encoder_kwargs=encoder_kwargs,
         )
-        # IMPORTANT!
-        # replace all BatchNorm with GroupNorm to work with EMA
-        # performance will tank if you forget to do this!
         obs_encoder = replace_bn_with_gn(obs_encoder)
         
         obs_dim = obs_encoder.output_shape()[0]
 
-        # create network object
         noise_pred_net = ConditionalUnet1D(
             input_dim=self.ac_dim,
             global_cond_dim=obs_dim*self.algo_config.horizon.observation_horizon
         )
 
-        # the final arch has 2 parts
         nets = nn.ModuleDict({
             'policy': nn.ModuleDict({
                 'obs_encoder': obs_encoder,
@@ -88,7 +84,6 @@ class OTDiffusionPolicyUNet(PolicyAlgo):
 
         nets = nets.float().to(self.device)
         
-        # setup noise scheduler
         noise_scheduler = None
         if self.algo_config.ddpm.enabled:
             noise_scheduler = DDPMScheduler(
@@ -109,12 +104,10 @@ class OTDiffusionPolicyUNet(PolicyAlgo):
         else:
             raise RuntimeError()
         
-        # setup EMA
         ema = None
         if self.algo_config.ema.enabled:
             ema = EMAModel(model=nets, power=self.algo_config.ema.power)
                 
-        # set attrs
         self.nets = nets
         self.noise_scheduler = noise_scheduler
         self.ema = ema
@@ -145,7 +138,7 @@ class OTDiffusionPolicyUNet(PolicyAlgo):
         input_batch["actions"] = batch["actions"][:, :Tp, :]
         
         if not self.action_check_done:
-            actions = input_batch["actions"]
+            actions = input_batch["actions"][2*B_ot:]
             in_range = (-1 <= actions) & (actions <= 1)
             all_in_range = torch.all(in_range).item()
             if not all_in_range:
@@ -183,15 +176,12 @@ class OTDiffusionPolicyUNet(PolicyAlgo):
             info = super(OTDiffusionPolicyUNet, self).train_on_batch(batch, epoch, validate=validate)
             actions = batch['actions']
             
-            # encode obs
             inputs = {
                 'obs': batch["obs"],
                 'goal': batch["goal_obs"]
             }
             for k in self.obs_shapes:
-                # first two dimensions should be [B, T] for inputs
                 if inputs['obs'][k].ndim - 2 == len(self.obs_shapes[k]) - 1:
-                    # add time dimension
                     inputs['obs'][k] = inputs['obs'][k].unsqueeze(1)
                 assert inputs['obs'][k].ndim - 2 == len(self.obs_shapes[k])
             
@@ -218,11 +208,6 @@ class OTDiffusionPolicyUNet(PolicyAlgo):
             M = ot_params["emb_scale"] * M_embed + ot_params["cost_scale"] * M_label.to(
                 M_embed.device)  # Ground cost
 
-            M_np = M.detach().cpu().numpy()
-            M_median = np.median(M_np)
-            if M_median > 0:
-                M_np = M_np / M_median
-
             if ot_params["heuristic"]:
                 src_n, tgt_n = ot_src_feat.shape[0], ot_tgt_feat.shape[0]
                 c = np.zeros((src_n, tgt_n))
@@ -231,13 +216,11 @@ class OTDiffusionPolicyUNet(PolicyAlgo):
                 c = None
 
             a, b = ot.unif(ot_src_feat.shape[0]), ot.unif(ot_tgt_feat.shape[0])
-            pi = ot.unbalanced.sinkhorn_stabilized_unbalanced(
-                a, b, M_np,
-                reg=ot_params["reg"],
-                reg_m=(ot_params["tau1"], ot_params["tau2"]),
-                c=c,
-                numItermax=200,
-            )
+            pi = ot.unbalanced.sinkhorn_knopp_unbalanced(a, b, M.detach().cpu().numpy(),
+                                                         ot_params["reg"],
+                                                         c=c,
+                                                         reg_m=(ot_params["tau1"],
+                                                                ot_params["tau2"]))
 
             pi_sum = pi.sum(dtype=np.float32)
             pi_diag = np.trace(pi, dtype=np.float32)
@@ -245,33 +228,37 @@ class OTDiffusionPolicyUNet(PolicyAlgo):
             pi = torch.from_numpy(pi).float().to(M_embed.device)
             ot_loss = torch.sum(pi * M)
 
+            OTDiffusionPolicyUNet._debug_step += 1
+            if OTDiffusionPolicyUNet._debug_step % 50 == 1:
+                M_np_raw = M.detach().cpu().numpy()
+                scaled_ot = ot_params["scale"] * ot_loss.item()
+                print(f"[OT DEBUG step={OTDiffusionPolicyUNet._debug_step}] "
+                      f"B_ot={B_ot} B_bc={B-(B_ot_src+B_ot_tgt)} | "
+                      f"M(combined): min={np.min(M_np_raw):.6f} mean={np.mean(M_np_raw):.4f} max={np.max(M_np_raw):.4f} | "
+                      f"M_embed: mean={M_embed.mean().item():.4f} | "
+                      f"M_label: mean={M_label.mean().item():.6f} | "
+                      f"pi: sum={pi_sum:.6f} diag={pi_diag:.6f} max={pi.max().item():.6f} | "
+                      f"ot_loss={ot_loss.item():.4f} scale*ot={scaled_ot:.6f}")
+
             obs_cond = bc_feat.flatten(start_dim=1)
             
-            # sample noise to add to actions
             noise = torch.randn(bc_act_label.shape, device=self.device)
             
-            # sample a diffusion iteration for each data point
             timesteps = torch.randint(
                 0, self.noise_scheduler.config.num_train_timesteps, 
                 (B-(B_ot_src+B_ot_tgt),), device=self.device
             ).long()
             
-            # add noise to the clean actions according to the noise magnitude at each diffusion iteration
-            # (this is the forward diffusion process)
             noisy_actions = self.noise_scheduler.add_noise(
                 bc_act_label, noise, timesteps)
             
-            # predict the noise residual
             noise_pred = self.nets['policy']['noise_pred_net'](
                 noisy_actions, timesteps, global_cond=obs_cond)
             
-            # L2 loss
-            l2_loss = F.mse_loss(noise_pred, noise) # may apply mask to compute loss only for bc batch
+            l2_loss = F.mse_loss(noise_pred, noise)
 
             loss = l2_loss + ot_params["scale"] * ot_loss
 
-            
-            # logging
             losses = {
                 'l2_loss': l2_loss,
                 'ot_loss': ot_loss,
@@ -285,14 +272,25 @@ class OTDiffusionPolicyUNet(PolicyAlgo):
             info["pi"] = pi
 
             if not validate:
-                # gradient step
                 policy_grad_norms = TorchUtils.backprop_for_loss(
                     net=self.nets,
                     optim=self.optimizers["policy"],
                     loss=loss,
                 )
+
+                enc_grad = sum(
+                    p.grad.data.norm(2).pow(2).item()
+                    for p in self.nets['policy']['obs_encoder'].parameters()
+                    if p.grad is not None
+                ) ** 0.5
+                unet_grad = sum(
+                    p.grad.data.norm(2).pow(2).item()
+                    for p in self.nets['policy']['noise_pred_net'].parameters()
+                    if p.grad is not None
+                ) ** 0.5
+                info["enc_grad_norm"] = enc_grad
+                info["unet_grad_norm"] = unet_grad
                 
-                # update Exponential Moving Average of the model weights
                 if self.ema is not None:
                     self.ema.step(self.nets)
                 
@@ -321,6 +319,10 @@ class OTDiffusionPolicyUNet(PolicyAlgo):
 
         if "policy_grad_norms" in info:
             log["Policy_Grad_Norms"] = info["policy_grad_norms"]
+        if "enc_grad_norm" in info:
+            log["enc_grad_norm"] = info["enc_grad_norm"]
+        if "unet_grad_norm" in info:
+            log["unet_grad_norm"] = info["unet_grad_norm"]
 
         ot_keys = ["pi_sum", "pi_diag", "pi", "M_embed", "M_label"]
         for k in ot_keys:
@@ -333,7 +335,6 @@ class OTDiffusionPolicyUNet(PolicyAlgo):
         """
         Reset algo state to prepare for environment rollouts.
         """
-        # setup inference queues
         To = self.algo_config.horizon.observation_horizon
         Ta = self.algo_config.horizon.action_horizon
         obs_queue = deque(maxlen=To)
@@ -352,36 +353,14 @@ class OTDiffusionPolicyUNet(PolicyAlgo):
         Returns:
             action (torch.Tensor): action tensor [1, Da]
         """
-        # obs_dict: key: [1,D]
         To = self.algo_config.horizon.observation_horizon
         Ta = self.algo_config.horizon.action_horizon
 
-        # TODO: obs_queue already handled by frame_stack
-        # make sure we have at least To observations in obs_queue
-        # if not enough, repeat
-        # if already full, append one to the obs_queue
-        # n_repeats = max(To - len(self.obs_queue), 1)
-        # self.obs_queue.extend([obs_dict] * n_repeats)
-        
         if len(self.action_queue) == 0:
-            # no actions left, run inference
-            # turn obs_queue into dict of tensors (concat at T dim)
-            # import pdb; pdb.set_trace()
-            # obs_dict_list = TensorUtils.list_of_flat_dict_to_dict_of_list(list(self.obs_queue))
-            # obs_dict_tensor = dict((k, torch.cat(v, dim=0).unsqueeze(0)) for k,v in obs_dict_list.items())
-            
-            # run inference
-            # [1,T,Da]
             action_sequence = self._get_action_trajectory(obs_dict=obs_dict)
-            
-            # put actions into the queue
             self.action_queue.extend(action_sequence[0])
         
-        # has action, execute from left to right
-        # [Da]
         action = self.action_queue.popleft()
-        
-        # [1,Da]
         action = action.unsqueeze(0)
         return action
         
@@ -398,53 +377,43 @@ class OTDiffusionPolicyUNet(PolicyAlgo):
         else:
             raise ValueError
         
-        # select network
         nets = self.nets
         if self.ema is not None:
             nets = self.ema.averaged_model
         
-        # encode obs
         inputs = {
             'obs': obs_dict,
             'goal': goal_dict
         }
         for k in self.obs_shapes:
-            # first two dimensions should be [B, T] for inputs
             if inputs['obs'][k].ndim - 2 == len(self.obs_shapes[k]) - 1:
-                # add time dimension
                 inputs['obs'][k] = inputs['obs'][k].unsqueeze(1)
             assert inputs['obs'][k].ndim - 2 == len(self.obs_shapes[k])
         obs_features = TensorUtils.time_distributed(inputs, nets['policy']['obs_encoder'], inputs_as_kwargs=True)
         assert obs_features.ndim == 3  # [B, T, D]
         B = obs_features.shape[0]
 
-        # reshape observation to (B,obs_horizon*obs_dim)
         obs_cond = obs_features.flatten(start_dim=1)
 
-        # initialize action from Guassian noise
         noisy_action = torch.randn(
             (B, Tp, action_dim), device=self.device)
         naction = noisy_action
         
-        # init scheduler
         self.noise_scheduler.set_timesteps(num_inference_timesteps)
 
         for k in self.noise_scheduler.timesteps:
-            # predict noise
             noise_pred = nets['policy']['noise_pred_net'](
                 sample=naction, 
                 timestep=k,
                 global_cond=obs_cond
             )
 
-            # inverse diffusion step (remove noise)
             naction = self.noise_scheduler.step(
                 model_output=noise_pred,
                 timestep=k,
                 sample=naction
             ).prev_sample
 
-        # process action using Ta
         start = To - 1
         end = start + Ta
         action = naction[:,start:end]
@@ -480,7 +449,7 @@ class OTDiffusionPolicyUNet(PolicyAlgo):
 
     
             
-            
+
 
 # =================== Vision Encoder Utils =====================
 def replace_submodules(
@@ -605,7 +574,6 @@ class ConditionalResidualBlock1D(nn.Module):
         ])
 
         # FiLM modulation https://arxiv.org/abs/1709.07871
-        # predicts per-channel scale and bias
         cond_channels = out_channels * 2
         self.out_channels = out_channels
         self.cond_encoder = nn.Sequential(
@@ -614,7 +582,6 @@ class ConditionalResidualBlock1D(nn.Module):
             nn.Unflatten(-1, (-1, 1))
         )
 
-        # make sure dimensions compatible
         self.residual_conv = nn.Conv1d(in_channels, out_channels, 1) \
             if in_channels != out_channels else nn.Identity()
 
@@ -736,17 +703,13 @@ class ConditionalUnet1D(nn.Module):
         global_cond: (B,global_cond_dim)
         output: (B,T,input_dim)
         """
-        # (B,T,C)
         sample = sample.moveaxis(-1,-2)
-        # (B,C,T)
 
-        # 1. time
         timesteps = timestep
         if not torch.is_tensor(timesteps):
             timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
         elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
             timesteps = timesteps[None].to(sample.device)
-        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
         timesteps = timesteps.expand(sample.shape[0])
 
         global_feature = self.diffusion_step_encoder(timesteps)
@@ -775,7 +738,5 @@ class ConditionalUnet1D(nn.Module):
 
         x = self.final_conv(x)
 
-        # (B,C,T)
         x = x.moveaxis(-1,-2)
-        # (B,T,C)
         return x

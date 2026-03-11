@@ -429,11 +429,7 @@ class ChunkSamplingDTWTrainDataset(torch.utils.data.Dataset):
                 ac = ac.reshape(-1, 1)
             ac_dict[k] = ac
 
-        action_normalization_stats = self.get_action_normalization_stats()
-        if action_normalization_stats is not None:
-            ac_dict = ObsUtils.normalize_dict(ac_dict, normalization_stats=action_normalization_stats)
-
-        # concatenate all action components
+        # concatenate all action components (no normalization for OT dataset)
         meta["actions"] = AcUtils.action_dict_to_vector(ac_dict)
 
         # also return the sampled index
