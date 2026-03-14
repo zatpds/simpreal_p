@@ -13,3 +13,4 @@ from robomimic.config.td3_bc_config import TD3_BCConfig
 from robomimic.config.diffusion_policy_config import DiffusionPolicyConfig
 from robomimic.config.diffusion_policy_ot_config import OTDiffusionPolicyConfig
 from robomimic.config.diffusion_policy_bea_config import BEADiffusionPolicyConfig
+from robomimic.config.diffusion_policy_mmd_config import MMDDiffusionPolicyConfig

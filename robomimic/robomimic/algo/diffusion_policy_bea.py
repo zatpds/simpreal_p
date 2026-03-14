@@ -117,11 +117,11 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
             self.loss_ema = None
 
         self._bea_initialized = True
-        print("[BEA] Initialized weights: m={}, n={}, q_shape=({},), "
-              "loss_ema={}, target_q_min={}".format(
-                  m, n, total,
-                  "beta={:.3f}".format(cfg.loss_ema_beta) if self.loss_ema is not None else "off",
-                  cfg.target_q_min))
+        ema_str = f"beta={cfg.loss_ema_beta:.3f}" if self.loss_ema is not None else "off"
+        print(
+            f"[BEA] Initialized weights: m={m}, n={n}, q_shape=({total},), "
+            f"loss_ema={ema_str}, target_q_min={cfg.target_q_min}"
+        )
 
     # ------------------------------------------------------------------
     # Batch processing — pass through sample indices
@@ -278,8 +278,10 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
         min_possible = q_lo.sum().item()
         max_possible = q_hi.sum().item()
         if target_sum < min_possible or target_sum > max_possible:
-            print("[BEA] WARNING: target_sum={:.2f} infeasible (range [{:.2f}, {:.2f}]). "
-                  "Clamping.".format(target_sum, min_possible, max_possible))
+            print(
+                f"[BEA] WARNING: target_sum={target_sum:.2f} infeasible "
+                f"(range [{min_possible:.2f}, {max_possible:.2f}]). Clamping."
+            )
             target_sum = max(min_possible, min(max_possible, target_sum))
 
         # Bisection: find nu such that sum(clip(q - nu, q_lo, q_hi)) = target_sum

@@ -12,3 +12,4 @@ from robomimic.algo.td3_bc import TD3_BC
 from robomimic.algo.diffusion_policy import DiffusionPolicyUNet
 from robomimic.algo.diffusion_policy_ot import OTDiffusionPolicyUNet
 from robomimic.algo.diffusion_policy_bea import BEADiffusionPolicyUNet
+from robomimic.algo.diffusion_policy_mmd import MMDDiffusionPolicyUNet
