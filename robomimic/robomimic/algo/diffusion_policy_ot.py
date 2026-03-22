@@ -1,5 +1,5 @@
 """
-Unbalanced Optimal Transport (UOT) variant of Diffusion Policy.
+UOT
 
 Extends DiffusionPolicyUNet with a Sinkhorn-based UOT coupling loss between
 source and target encoder features, combined with standard diffusion BC loss
@@ -7,16 +7,6 @@ on a dedicated BC portion of each batch.
 
 Batch layout: [src_ot(B_ot) | tgt_ot(B_ot) | bc(remainder)]
 Loss:  l2_diffusion + scale * OT_loss
-
-The transport plan pi is computed by solving unbalanced OT via
-sinkhorn_knopp_unbalanced (POT library) on a mixed cost matrix:
-    M = emb_scale * M_embed + cost_scale * M_label
-where M_embed is the squared-L2 distance between encoder features and
-M_label uses either end-effector pose or first-step action as a
-task-level anchor.  Marginal relaxation (tau1, tau2) allows the plan
-to discard unmatched samples across domains.
-
-Reference: POT library — ot.unbalanced.sinkhorn_knopp_unbalanced
 """
 from collections import OrderedDict
 
@@ -55,17 +45,12 @@ class OTDiffusionPolicyUNet(DiffusionPolicyUNet):
     """
     Diffusion Policy with Unbalanced Optimal Transport domain alignment.
 
-    Inherits the full DiffusionPolicyUNet (network creation, inference,
-    EMA, serialization) and overrides training-related methods to add:
-      - A UOT coupling loss between source/target encoder features
-      - An optional label-based cost component in the transport cost matrix
+    Inherits the full DiffusionPolicyUNet
     """
 
     _debug_step = 0
 
-    # ------------------------------------------------------------------
-    # Observation encoding helper (shared across train methods)
-    # ------------------------------------------------------------------
+    #### Observation encoding helper -----------------------------------------------------------------------------------
 
     def _encode_obs(self, batch):
         """
@@ -89,9 +74,7 @@ class OTDiffusionPolicyUNet(DiffusionPolicyUNet):
         assert obs_features.ndim == 3  # [B, T, D]
         return obs_features
 
-    # ------------------------------------------------------------------
-    # Batch processing
-    # ------------------------------------------------------------------
+    #### Batch processing ----------------------------------------------------------------------------------------------
 
     def process_batch_for_training(self, batch, B_ot):
         """
@@ -128,9 +111,7 @@ class OTDiffusionPolicyUNet(DiffusionPolicyUNet):
 
         return TensorUtils.to_device(TensorUtils.to_float(input_batch), self.device)
 
-    # ------------------------------------------------------------------
-    # Training step
-    # ------------------------------------------------------------------
+    #### Training step -------------------------------------------------------------------------------------------------
 
     def train_on_batch(self, batch, B_ot, ot_params, epoch, validate=False):
         """
@@ -286,10 +267,6 @@ class OTDiffusionPolicyUNet(DiffusionPolicyUNet):
                 info["policy_grad_norms"] = policy_grad_norms
 
         return info
-
-    # ------------------------------------------------------------------
-    # Logging
-    # ------------------------------------------------------------------
 
     def log_info(self, info):
         """Summarize training info for tensorboard logging."""

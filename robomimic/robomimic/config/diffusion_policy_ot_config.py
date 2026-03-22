@@ -8,13 +8,7 @@ class OTDiffusionPolicyConfig(BaseConfig):
     ALGO_NAME = "diffusion_policy_ot"
     
     def algo_config(self):
-        """
-        This function populates the `config.algo` attribute of the config, and is given to the 
-        `Algo` subclass (see `algo/algo.py`) for each algorithm through the `algo_config` 
-        argument to the constructor. Any parameter that an algorithm needs to determine its 
-        training and test-time behavior should be populated here.
-        """
-        
+
         # optimization parameters
         self.algo.optim_params.policy.optimizer_type = "adam"
         self.algo.optim_params.policy.learning_rate.initial = 1e-4      # policy learning rate

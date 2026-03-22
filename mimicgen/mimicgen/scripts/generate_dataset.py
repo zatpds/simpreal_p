@@ -457,10 +457,12 @@ def generate_dataset(
             playback_video_path = os.path.join(new_dataset_folder_path, "playback_{}.mp4".format(new_dataset_folder_name))
             num_render = mg_config.experiment.num_demo_to_render
             print("Rendering successful trajectories...")
+            playback_cameras = list(mg_config.obs.camera_names) if len(mg_config.obs.camera_names) > 0 else None
             RobomimicUtils.make_dataset_video(
                 dataset_path=new_dataset_path,
                 video_path=playback_video_path,
                 num_render=num_render,
+                render_image_names=playback_cameras,
             )
         else:
             print("\n" + "*" * 80)
@@ -475,6 +477,7 @@ def generate_dataset(
                     dataset_path=new_failed_dataset_path,
                     video_path=playback_video_path,
                     num_render=num_render,
+                    render_image_names=playback_cameras,
                 )
             else:
                 print("\n" + "*" * 80)

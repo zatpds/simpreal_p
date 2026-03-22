@@ -179,8 +179,8 @@ class Stack_D0(Stack, SingleArmEnv_MG):
         """
         return { 
             k : dict(
-                x=(-0.08, 0.08),
-                y=(-0.08, 0.08),
+                x=(-0.12, 0.12),
+                y=(-0.12, 0.12),
                 z_rot=(0., 2. * np.pi),
                 # NOTE: hardcoded @self.table_offset since this might be called in init function
                 reference=np.array((0, 0, 0.8)),

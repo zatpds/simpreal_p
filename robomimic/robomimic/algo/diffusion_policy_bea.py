@@ -1,20 +1,12 @@
 """
-Best-Effort Adaptation (BEA) for Diffusion Policy.
+BEA
 
-Implements Algorithm 3 (q-Weighted ERM via Alternating Minimization):
+The combined dataset U = S ∪ T is reindexed so that indices 0..m-1 are
+source and m..m+n-1 are target.  The weight vector q ∈ R^{m+n} lives on
+CPU and is sliced to GPU per mini-batch via the "index" field that
+MetaDataset already provides in each sample.
 
-  Each outer iteration alternates between:
-    (1) Updating per-sample weights q with the predictor h fixed
-        (projected subgradient step with discrepancy + regularization),
-    (2) Updating predictor h with q fixed
-        (weighted ERM: q-weighted diffusion loss).
-
-  The combined dataset U = S ∪ T is reindexed so that indices 0..m-1 are
-  source and m..m+n-1 are target.  The weight vector q ∈ R^{m+n} lives on
-  CPU and is sliced to GPU per mini-batch via the "index" field that
-  MetaDataset already provides in each sample.
-
-Key assumptions / design decisions:
+Design decisions:
   - q is stored as a flat CPU tensor of size (m+n,).  It is NOT a learnable
     nn.Parameter — it is updated by an explicit projected subgradient rule,
     not by autograd.
@@ -51,16 +43,11 @@ def algo_config_to_class(algo_config):
 
 class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
     """
-    Diffusion Policy with Best-Effort Adaptation (q-weighted ERM).
-
-    Inherits the full DiffusionPolicyUNet (network creation, inference,
-    EMA, serialization) and overrides / extends the training-related methods.
+    BEA Diffusion Policy with UNet backbone,
     """
 
     def _create_networks(self):
         super()._create_networks()
-        # BEA weight state — initialized later by init_bea_weights() once
-        # the dataset sizes m, n are known.
         self.q = None        # (m+n,) CPU float tensor
         self.p0 = None       # (m+n,) reference weights
         self.d = None         # (m+n,) discrepancy penalties
@@ -69,9 +56,7 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
         self.loss_ema = None  # (m+n,) EMA of per-sample losses (None if disabled)
         self._bea_initialized = False
 
-    # ------------------------------------------------------------------
-    # BEA weight initialization (called once from train.py)
-    # ------------------------------------------------------------------
+    #### BEA weight initialization --------------------------------------------------------------------------------
 
     def init_bea_weights(self, m, n):
         """
@@ -123,9 +108,7 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
             f"loss_ema={ema_str}, target_q_min={cfg.target_q_min}"
         )
 
-    # ------------------------------------------------------------------
-    # Batch processing — pass through sample indices
-    # ------------------------------------------------------------------
+    #### Batch processing — pass through sample indices ------------------------------------------------------------
 
     def process_batch_for_training(self, batch):
         """
@@ -137,9 +120,7 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
             input_batch["index"] = batch["index"].long().to(self.device)
         return input_batch
 
-    # ------------------------------------------------------------------
-    # Per-sample diffusion loss (no batch reduction)
-    # ------------------------------------------------------------------
+    #### Per-sample diffusion loss (no batch reduction) ------------------------------------------------------------
 
     def _diffusion_forward(self, batch):
         """
@@ -179,9 +160,7 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
 
         return per_sample_loss, {"noise_pred": noise_pred, "noise": noise}
 
-    # ------------------------------------------------------------------
-    # q-update step  (Algorithm 3, step 1)
-    # ------------------------------------------------------------------
+    #### q-update step  ------------------------------------------------------------------------------------------
 
     @torch.no_grad()
     def update_q(self, batch_indices, per_sample_losses):
@@ -303,9 +282,7 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
         nu = (lo_nu + hi_nu) / 2.0
         self.q = torch.clamp(q - nu, min=q_lo, max=q_hi)
 
-    # ------------------------------------------------------------------
-    # q-weighted training step  (Algorithm 3, step 2)
-    # ------------------------------------------------------------------
+    #### q-weighted training step  --------------------------------------------------------------------------------
 
     def train_on_batch(self, batch, epoch, validate=False):
         """
@@ -345,7 +322,7 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
                 "q_std": q_batch.std() if B > 1 else torch.tensor(0.0),
             }
 
-            # Per-domain q stats (compute mask on device directly)
+            # Per-domain q stats
             src_mask = indices < self.m
             tgt_mask = ~src_mask
             if src_mask.any():
@@ -368,9 +345,7 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
 
         return info
 
-    # ------------------------------------------------------------------
-    # Compute losses for q-update pass (no gradient on model params)
-    # ------------------------------------------------------------------
+    #### Compute losses for q-update pass (no gradient on model params) ------------------------------------------
 
     @torch.no_grad()
     def compute_losses_for_q_update(self, batch):
@@ -389,10 +364,6 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
         indices = batch["index"].long()
         return indices, per_sample_loss
 
-    # ------------------------------------------------------------------
-    # Logging
-    # ------------------------------------------------------------------
-
     def log_info(self, info):
         log = OrderedDict()
         log["Loss"] = info["losses"]["l2_loss"].item()
@@ -407,9 +378,7 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
             log["Policy_Grad_Norms"] = info["policy_grad_norms"]
         return log
 
-    # ------------------------------------------------------------------
-    # Serialization — save / load q weights alongside model
-    # ------------------------------------------------------------------
+    #### Serialization — save / load q weights alongside model ------------------------------------------------------
 
     def serialize(self):
         d = super().serialize()
