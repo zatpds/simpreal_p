@@ -108,6 +108,90 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
             f"loss_ema={ema_str}, target_q_min={cfg.target_q_min}"
         )
 
+    #### Dynamic discrepancy (k-NN in obs-encoder feature space) ---------------------------------------------------
+
+    @torch.no_grad()
+    def _extract_obs_embeddings(self, data_loader, obs_normalization_stats=None):
+        """
+        Single forward pass through the obs encoder to collect (index, embedding)
+        for every sample in data_loader.  Returns tensors sorted by index.
+        """
+        all_idx, all_emb = [], []
+        self.set_eval()
+        for batch in data_loader:
+            input_batch = self.process_batch_for_training(batch)
+            input_batch = self.postprocess_batch_for_training(
+                input_batch, obs_normalization_stats=obs_normalization_stats,
+            )
+            inputs = {"obs": input_batch["obs"], "goal": input_batch["goal_obs"]}
+            obs_features = TensorUtils.time_distributed(
+                inputs, self.nets["policy"]["obs_encoder"], inputs_as_kwargs=True,
+            )
+            emb = obs_features.flatten(start_dim=1)  # (B, D)
+            all_idx.append(input_batch["index"].long().cpu())
+            all_emb.append(emb.cpu())
+
+        all_idx = torch.cat(all_idx)
+        all_emb = torch.cat(all_emb)
+        order = all_idx.argsort()
+        return all_idx[order], all_emb[order]
+
+    @torch.no_grad()
+    def update_d_knn(self, data_loader, obs_normalization_stats=None):
+        """
+        Recompute per-source discrepancy d_i as mean k-NN distance to target
+        embeddings in obs-encoder feature space, normalised by mean
+        within-target k-NN distance so that d_i ≈ 1 means "fits in with
+        target" and d_i >> 1 means "outlier relative to target spread".
+        """
+        cfg = self.algo_config.bea
+        k = cfg.dynamic_d_k
+
+        indices, embeddings = self._extract_obs_embeddings(
+            data_loader, obs_normalization_stats,
+        )
+
+        src_emb = embeddings[:self.m]   # (m, D)
+        tgt_emb = embeddings[self.m:]   # (n, D)
+        n = tgt_emb.shape[0]
+
+        effective_k = min(k, n)
+
+        # Source-to-target k-NN distances
+        st_dists = torch.cdist(src_emb, tgt_emb, p=2)       # (m, n)
+        st_topk, _ = st_dists.topk(effective_k, dim=1, largest=False)
+        raw_d = st_topk.mean(dim=1)  # (m,)
+
+        # Within-target k-NN distances (use k+1 since self is included,
+        # then drop the zero self-distance)
+        tt_dists = torch.cdist(tgt_emb, tgt_emb, p=2)       # (n, n)
+        tt_k = min(effective_k + 1, n)
+        tt_topk, _ = tt_dists.topk(tt_k, dim=1, largest=False)
+        # Column 0 is self-distance (0), take columns 1..tt_k
+        tgt_ref = tt_topk[:, 1:].mean().clamp(min=1e-8)
+
+        raw_d = raw_d / tgt_ref
+
+        self.d[:self.m] = raw_d
+        self.d[self.m:] = 0.0
+
+        stats = {
+            "d_source_mean": self.d[:self.m].mean().item(),
+            "d_source_std": self.d[:self.m].std().item(),
+            "d_source_min": self.d[:self.m].min().item(),
+            "d_source_max": self.d[:self.m].max().item(),
+            "d_target_ref": tgt_ref.item(),
+        }
+        print(
+            "[BEA] dynamic d: mean={:.4f}, std={:.4f}, "
+            "min={:.4f}, max={:.4f}, tgt_ref={:.4f}".format(
+                stats["d_source_mean"], stats["d_source_std"],
+                stats["d_source_min"], stats["d_source_max"],
+                stats["d_target_ref"],
+            )
+        )
+        return stats
+
     #### Batch processing — pass through sample indices ------------------------------------------------------------
 
     def process_batch_for_training(self, batch):

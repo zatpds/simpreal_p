@@ -28,6 +28,12 @@ class BEADiffusionPolicyConfig(DiffusionPolicyConfig):
         #### discrepancy penalties d_i 
         # d_i = discrepancy_value for source samples, 0 for target samples
         self.algo.bea.discrepancy_value = 1.0
+        # dynamic_d: if True, compute per-sample d_i via k-NN distance in
+        # obs-encoder feature space (updated every q_update_every epochs).
+        # if False, use the flat constant discrepancy_value for all source.
+        self.algo.bea.dynamic_d = False
+        # k for k-NN distance computation (only used when dynamic_d=True)
+        self.algo.bea.dynamic_d_k = 3
 
         #### reference weights p_0
         # p0_source: reference weight for each source sample (typically 0)

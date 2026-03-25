@@ -180,7 +180,7 @@ class Stack(ManipulationEnv):
         # settings for table top
         self.table_full_size = table_full_size
         self.table_friction = table_friction
-        self.table_offset = np.array((0, 0, 0.912))
+        self.table_offset = np.array((0, 0, 0.8))
 
         # reward configuration
         self.reward_scale = reward_scale
@@ -356,15 +356,15 @@ class Stack(ManipulationEnv):
         )
         self.cubeA = BoxObject(
             name="cubeA",
-            size_min=[0.013, 0.013, 0.013],
-            size_max=[0.013, 0.013, 0.013],
+            size_min=[0.02, 0.02, 0.02],
+            size_max=[0.02, 0.02, 0.02],
             rgba=[1, 0, 0, 1],
             material=redwood,
         )
         self.cubeB = BoxObject(
             name="cubeB",
-            size_min=[0.03, 0.03, 0.03],
-            size_max=[0.03, 0.03, 0.03],
+            size_min=[0.025, 0.025, 0.025],
+            size_max=[0.025, 0.025, 0.025],
             rgba=[0, 1, 0, 1],
             material=greenwood,
         )
@@ -377,8 +377,8 @@ class Stack(ManipulationEnv):
             self.placement_initializer = UniformRandomSampler(
                 name="ObjectSampler",
                 mujoco_objects=cubes,
-                x_range=[-0.12, 0.12],
-                y_range=[-0.12, 0.12],
+                x_range=[-0.08, 0.08],
+                y_range=[-0.08, 0.08],
                 rotation=None,
                 ensure_object_boundary_in_range=False,
                 ensure_valid_placement=True,
