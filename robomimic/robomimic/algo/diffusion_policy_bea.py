@@ -366,6 +366,99 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
         nu = (lo_nu + hi_nu) / 2.0
         self.q = torch.clamp(q - nu, min=q_lo, max=q_hi)
 
+    #### Global q solver (paper faithful) --------------------------------------------------------------------------
+
+    @torch.no_grad()
+    def solve_q_global(self, all_losses):
+        """
+        Global q solver
+
+        Given all per-sample losses l_i (with h fixed), solve:
+
+            min_{q}  sum_i q_i * c_i  +  lambda_1 * ||q - p0||_1  +  lambda_2 * ||q||_2^2
+            s.t.     q_lo_i <= q_i <= q_max       for all i
+                     sum_i q_i = target_sum        (if sum_constraint_enabled)
+
+        where c_i = l_i + lambda_d * d_i.
+
+        Via the Lagrangian for the sum constraint we introduce multiplier mu
+        so each per-element subproblem becomes:
+
+            min_{q_i}  (c_i - mu) * q_i + lam1 * |q_i - p0_i| + lam2 * q_i^2
+            s.t.       q_lo_i <= q_i <= q_max
+
+        with a closed-form solution per element.  We bisect on mu so that
+        sum_i q_i*(mu) = target_sum.  When sum_constraint_enabled is False
+        we simply use mu = 0.
+
+        Args:
+            all_losses: (m+n,) tensor of per-sample losses, indexed 0..m+n-1.
+        """
+        cfg = self.algo_config.bea
+        m, n = self.m, self.n
+        total = m + n
+
+        c = all_losses.clone()
+        c[:m] += cfg.lambda_d * self.d[:m]
+
+        p0 = self.p0
+        lam1 = cfg.lambda_1
+        lam2 = cfg.lambda_2
+        q_max = cfg.q_max
+
+        q_lo = torch.zeros(total, dtype=torch.float32)
+        if cfg.target_q_min > 0 and n > 0:
+            q_lo[m:] = cfg.target_q_min
+        q_hi = torch.full((total,), q_max, dtype=torch.float32)
+
+        def _solve_per_element(mu):
+            """Closed-form for  min (c_i-mu)*q_i + lam1*|q_i-p0_i| + lam2*q_i^2."""
+            eff = c - mu
+            residual = eff + 2.0 * lam2 * p0
+            q_star = torch.where(
+                residual < -lam1,
+                (-eff - lam1) / (2.0 * lam2),
+                torch.where(
+                    residual > lam1,
+                    (-eff + lam1) / (2.0 * lam2),
+                    p0,
+                ),
+            )
+            return torch.clamp(q_star, min=q_lo, max=q_hi)
+
+        if not cfg.sum_constraint_enabled:
+            self.q = _solve_per_element(0.0)
+            return
+
+        target_sum = float(n) + cfg.sum_constraint_alpha * float(m)
+
+        # Initial bracket: sum(q) is non-decreasing in mu.
+        mu_lo = float(c.min()) - lam1 - 2.0 * lam2 * q_max - 1.0
+        mu_hi = float(c.max()) + lam1 + 1.0
+        for _ in range(20):
+            if _solve_per_element(mu_lo).sum().item() >= target_sum:
+                mu_lo -= abs(mu_lo) + 10.0
+            else:
+                break
+        for _ in range(20):
+            if _solve_per_element(mu_hi).sum().item() <= target_sum:
+                mu_hi += abs(mu_hi) + 10.0
+            else:
+                break
+
+        for _ in range(100):
+            mu_mid = (mu_lo + mu_hi) / 2.0
+            q_mid = _solve_per_element(mu_mid)
+            s = q_mid.sum().item()
+            if abs(s - target_sum) < 1e-6:
+                break
+            if s < target_sum:
+                mu_lo = mu_mid
+            else:
+                mu_hi = mu_mid
+
+        self.q = _solve_per_element((mu_lo + mu_hi) / 2.0)
+
     #### q-weighted training step  --------------------------------------------------------------------------------
 
     def train_on_batch(self, batch, epoch, validate=False):
@@ -486,4 +579,6 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
             self.m = bea["m"]
             self.n = bea["n"]
             self.loss_ema = bea.get("loss_ema", None)
+            self._bea_initialized = True
+
             self._bea_initialized = True

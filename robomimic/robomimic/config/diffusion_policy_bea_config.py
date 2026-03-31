@@ -64,6 +64,12 @@ class BEADiffusionPolicyConfig(DiffusionPolicyConfig):
         # alpha=0 → only target mass, alpha=1 → full source+target mass.
         self.algo.bea.sum_constraint_alpha = 0.5
 
+        #### q update mode
+        # "full"     — solve the global convex optimization problem for q
+        #              (paper-faithful: argmin over the full dataset)
+        # "minibatch" — projected subgradient descent on q per mini-batch
+        self.algo.bea.q_update_mode = "full"
+
         #### q update schedule
         # update q every K epochs (1 = every epoch, faithful to algorithm)
         self.algo.bea.q_update_every = 1

@@ -698,3 +698,26 @@ class MugCleanup_O2(MugCleanup_D0):
             friction=(1, 1, 1),
             margin=0.001,
         )
+
+
+import xml.etree.ElementTree as ET
+
+_WOOD_TEXTURE_FILE = "wood-varnished-panels.png"
+
+
+class MugCleanupWood(MugCleanup):
+    """MugCleanup with a wood table surface instead of ceramic."""
+
+    def edit_model_xml(self, xml_str):
+        xml_str = super().edit_model_xml(xml_str)
+
+        root = ET.fromstring(xml_str)
+        asset = root.find("asset")
+
+        for tex in asset.findall("texture"):
+            fpath = tex.get("file", "")
+            if fpath.endswith("ceramic.png"):
+                tex.set("file", fpath.replace("ceramic.png", _WOOD_TEXTURE_FILE))
+                break
+
+        return ET.tostring(root, encoding="utf8").decode("utf8")
