@@ -6,30 +6,32 @@ source and m..m+n-1 are target.  The weight vector q ∈ R^{m+n} lives on
 CPU and is sliced to GPU per mini-batch via the "index" field that
 MetaDataset already provides in each sample.
 
-Design decisions:
-  - q is stored as a flat CPU tensor of size (m+n,).  It is NOT a learnable
-    nn.Parameter — it is updated by an explicit projected subgradient rule,
-    not by autograd.
-  - The per-sample diffusion loss is MSE between predicted and true noise,
-    averaged over the (time, action_dim) axes but NOT over the batch axis.
-    This gives a (B,) vector used for both q-update and q-weighted training.
-  - The dataset must include an "index" key in each batch (MetaDataset does
-    this automatically).  process_batch_for_training passes it through.
-  - The bounded simplex projection (for the optional sum constraint) uses
-    bisection on the Lagrange multiplier, which is exact up to tolerance.
-  - sign(0) is treated as 0 (a valid subgradient of |u| at u=0).
+Config layout (under algo.bea):
+  lambda_1, lambda_2          — regularization coefficients
+  q.mode                      — "full" or "minibatch"
+  q.update_freq               — update q every K epochs
+  q.max                       — upper bound on each q_i
+  q.target_min                — lower bound for target q_i
+  q.eta                       — step size (minibatch mode only)
+  q.sum_constraint_enabled    — enforce sum(q) = target_sum
+  q.sum_constraint_alpha      — target_sum = n + alpha * m
+  d.mode                      — "d_hat", "knn", or "classifier"
+  d.k                         — k-NN k (knn mode only)
+  d.value                     — constant d (d_hat mode only)
+  d.lambda_d                  — coefficient on discrepancy penalty
+  p0_source, p0_target, p0_target_uniform — reference weights
+  loss_ema_beta               — EMA smoothing (0 = disabled)
 """
 
-from collections import OrderedDict, deque
+from collections import OrderedDict
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.torch_utils as TorchUtils
 
-from robomimic.algo import register_algo_factory_func, PolicyAlgo
+from robomimic.algo import register_algo_factory_func
 from robomimic.algo.diffusion_policy import DiffusionPolicyUNet
 
 
@@ -75,12 +77,11 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
         total = m + n
 
         # Reference weights p0
-        # When p0_target_uniform=True, each target sample gets p0=1.0 (not
-        # 1/n).  This makes the L1 regularization lambda_1*||q-p0||_1 a
-        # meaningful anchor: it pulls target q back toward 1.0 once the
-        # model is trained and loss is small enough for the pull to matter.
         p0 = torch.zeros(total, dtype=torch.float32)
-        p0[:m] = cfg.p0_source
+        if getattr(cfg, 'p0_source_uniform', False):
+            p0[:m] = 1.0
+        else:
+            p0[:m] = cfg.p0_source
         if cfg.p0_target_uniform:
             p0[m:] = 1.0
         else:
@@ -89,7 +90,7 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
 
         # Discrepancy penalties: d_hat > 0 for source, 0 for target
         d = torch.zeros(total, dtype=torch.float32)
-        d[:m] = cfg.discrepancy_value
+        d[:m] = cfg.d.value
         self.d = d
 
         # Initialize q = p0 (algorithm line 3)
@@ -105,10 +106,24 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
         ema_str = f"beta={cfg.loss_ema_beta:.3f}" if self.loss_ema is not None else "off"
         print(
             f"[BEA] Initialized weights: m={m}, n={n}, q_shape=({total},), "
-            f"loss_ema={ema_str}, target_q_min={cfg.target_q_min}"
+            f"loss_ema={ema_str}, q.target_min={cfg.q.target_min}"
         )
 
-    #### Dynamic discrepancy (k-NN in obs-encoder feature space) ---------------------------------------------------
+    #### Weight-decay helpers (gamma, R_DP) for the ||q||_inf * R_DP(h) term --------------------------------------
+
+    def _get_gamma(self):
+        """Return the weight-decay coefficient (L2 regularization) from the optimizer config."""
+        return float(self.optim_params["policy"]["regularization"]["L2"])
+
+    @torch.no_grad()
+    def compute_r_dp(self):
+        """Compute R_DP(h) = 0.5 * sum_w ||w||^2 over all model parameters."""
+        total = 0.0
+        for p in self.nets.parameters():
+            total = total + p.data.pow(2).sum()
+        return 0.5 * total
+
+    #### Dynamic discrepancy (k-NN & classifer) -------------------------------------------------------------------
 
     @torch.no_grad()
     def _extract_obs_embeddings(self, data_loader, obs_normalization_stats=None):
@@ -145,7 +160,7 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
         target" and d_i >> 1 means "outlier relative to target spread".
         """
         cfg = self.algo_config.bea
-        k = cfg.dynamic_d_k
+        k = cfg.d.k
 
         indices, embeddings = self._extract_obs_embeddings(
             data_loader, obs_normalization_stats,
@@ -188,6 +203,48 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
                 stats["d_source_mean"], stats["d_source_std"],
                 stats["d_source_min"], stats["d_source_max"],
                 stats["d_target_ref"],
+            )
+        )
+        return stats
+
+    @torch.no_grad()
+    def update_d_classifier(self, data_loader, obs_normalization_stats=None):
+        """
+        Recompute per-source discrepancy d_i via a domain classifier trained
+        on obs-encoder embeddings.  d_i = P(source | x_i): source samples
+        that look target-like get low d, clearly-source samples get high d.
+
+        Source embeddings are subsampled to match the target count for
+        balanced classifier training, then the fitted classifier is applied
+        to all source samples.
+        """
+        from robomimic.utils.domain_classifier import compute_d_from_domain_classifier
+
+        indices, embeddings = self._extract_obs_embeddings(
+            data_loader, obs_normalization_stats,
+        )
+
+        src_emb = embeddings[:self.m]
+        tgt_emb = embeddings[self.m:]
+
+        d_per_sample, clf_info = compute_d_from_domain_classifier(src_emb, tgt_emb)
+
+        self.d[:self.m] = torch.from_numpy(d_per_sample)
+        self.d[self.m:] = 0.0
+
+        stats = {
+            "d_classifier_auc": clf_info["auc"],
+            "d_source_mean": self.d[:self.m].mean().item(),
+            "d_source_std": self.d[:self.m].std().item(),
+            "d_source_min": self.d[:self.m].min().item(),
+            "d_source_max": self.d[:self.m].max().item(),
+        }
+        print(
+            "[BEA] domain classifier d: AUC={:.4f}, mean={:.4f}, std={:.4f}, "
+            "min={:.4f}, max={:.4f}".format(
+                clf_info["auc"],
+                stats["d_source_mean"], stats["d_source_std"],
+                stats["d_source_min"], stats["d_source_max"],
             )
         )
         return stats
@@ -247,12 +304,14 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
     #### q-update step  ------------------------------------------------------------------------------------------
 
     @torch.no_grad()
-    def update_q(self, batch_indices, per_sample_losses):
+    def update_q(self, batch_indices, per_sample_losses, r_dp_value=0.0):
         """
         Projected subgradient step on q for the given batch indices.
 
         For each i in batch_indices:
-            g_i = l_i + lambda_d * d_i + lambda_1 * sign(q_i - p0_i) + 2 * lambda_2 * q_i
+            g_i = l_i + lambda_d * d_i
+                  + gamma * r_dp * (1 if q_i == ||q||_inf else 0)
+                  + lambda_1 * sign(q_i - p0_i) + 2 * lambda_2 * q_i
             q_i = q_i - eta_q * g_i
             q_i = clip(q_i, 0, q_max)
 
@@ -270,6 +329,7 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
         Args:
             batch_indices: (B,) long tensor (CPU or GPU) — global dataset indices
             per_sample_losses: (B,) float tensor (CPU or GPU) — l(h(x_i), y_i)
+            r_dp_value: scalar — R_DP(h) (weight-decay regularizer), precomputed.
         """
         cfg = self.algo_config.bea
         idx = batch_indices.cpu()
@@ -291,16 +351,25 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
         # sign(0) = 0 which is a valid subgradient of |u| at u=0
         grad = (
             losses_for_grad
-            + cfg.lambda_d * d
+            + cfg.d.lambda_d * d
             + cfg.lambda_1 * torch.sign(q - p0)
             + 2.0 * cfg.lambda_2 * q
         )
 
-        q = q - cfg.eta_q * grad
-        q = q.clamp(0.0, cfg.q_max)
+        # Subgradient of gamma * R_DP * ||q||_inf w.r.t. q_i:
+        # nonzero only for elements achieving the global max.
+        gamma = self._get_gamma()
+        if gamma > 0 and r_dp_value > 0:
+            q_inf = self.q.max().item()
+            is_max = (q - q_inf).abs() < 1e-8
+            n_max = is_max.float().sum().clamp(min=1.0)
+            grad = grad + gamma * r_dp_value * (is_max.float() / n_max)
+
+        q = q - cfg.q.eta * grad
+        q = q.clamp(0.0, cfg.q.max)
 
         # Enforce target weight floor if configured
-        target_q_min = cfg.target_q_min
+        target_q_min = cfg.q.target_min
         if target_q_min > 0:
             target_mask = idx >= self.m
             q[target_mask] = q[target_mask].clamp(min=target_q_min)
@@ -311,30 +380,28 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
         """
         Project q onto the constraint set
             {q : sum(q) = target_sum, lo_i <= q_i <= q_max}
-        where target_sum = n + alpha * m, and lo_i = target_q_min for
+        where target_sum = n + alpha * m, and lo_i = target_min for
         target samples (i >= m) and 0 for source samples (i < m).
 
         Uses bisection on the Lagrange multiplier nu:
             q_i^*(nu) = clip(q_i - nu, lo_i, q_max)
         Find nu such that sum_i q_i^*(nu) = target_sum.
 
-        Only called if sum_constraint_enabled is True.
+        ONLY called if sum_constraint_enabled is True.
         """
         cfg = self.algo_config.bea
-        if not cfg.sum_constraint_enabled:
-            # Even without the sum constraint, enforce target_q_min
-            if cfg.target_q_min > 0 and self.n > 0:
-                self.q[self.m:] = self.q[self.m:].clamp(min=cfg.target_q_min)
+        if not cfg.q.sum_constraint_enabled:
+            if cfg.q.target_min > 0 and self.n > 0:
+                self.q[self.m:] = self.q[self.m:].clamp(min=cfg.q.target_min)
             return
 
-        target_sum = float(self.n) + cfg.sum_constraint_alpha * float(self.m)
+        target_sum = float(self.n) + cfg.q.sum_constraint_alpha * float(self.m)
         q = self.q
-        q_max = cfg.q_max
+        q_max = cfg.q.max
 
-        # Per-sample lower bounds: target_q_min for target, 0 for source
         q_lo = torch.zeros_like(q)
-        if cfg.target_q_min > 0 and self.n > 0:
-            q_lo[self.m:] = cfg.target_q_min
+        if cfg.q.target_min > 0 and self.n > 0:
+            q_lo[self.m:] = cfg.q.target_min
         q_hi = torch.full_like(q, q_max)
 
         # Feasibility check
@@ -366,52 +433,65 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
         nu = (lo_nu + hi_nu) / 2.0
         self.q = torch.clamp(q - nu, min=q_lo, max=q_hi)
 
-    #### Global q solver (paper faithful) --------------------------------------------------------------------------
+    #### Global q solver ------------------------------------------------------------------------------------------
 
     @torch.no_grad()
-    def solve_q_global(self, all_losses):
+    def solve_q_global(self, all_losses, r_dp_value=0.0):
         """
         Global q solver
 
         Given all per-sample losses l_i (with h fixed), solve:
 
-            min_{q}  sum_i q_i * c_i  +  lambda_1 * ||q - p0||_1  +  lambda_2 * ||q||_2^2
+            min_{q}  sum_i q_i * c_i  +  gamma * R_DP * ||q||_inf
+                     +  lambda_1 * ||q - p0||_1  +  lambda_2 * ||q||_2^2
             s.t.     q_lo_i <= q_i <= q_max       for all i
                      sum_i q_i = target_sum        (if sum_constraint_enabled)
 
-        where c_i = l_i + lambda_d * d_i.
+        where c_i = l_i + lambda_d * d_i  and  gamma * R_DP is precomputed.
 
-        Via the Lagrangian for the sum constraint we introduce multiplier mu
-        so each per-element subproblem becomes:
+        The ||q||_inf term couples all elements.  We handle it by introducing
+        t = ||q||_inf as an auxiliary variable and searching over t:
 
-            min_{q_i}  (c_i - mu) * q_i + lam1 * |q_i - p0_i| + lam2 * q_i^2
-            s.t.       q_lo_i <= q_i <= q_max
+            F(t) = min_{q: q_i <= t}  [separable objective]  +  gamma * R_DP * t
 
-        with a closed-form solution per element.  We bisect on mu so that
-        sum_i q_i*(mu) = target_sum.  When sum_constraint_enabled is False
-        we simply use mu = 0.
+        For each candidate t, the inner problem is separable with the same
+        closed-form per element (but q_hi capped at min(q_max, t)).
+        F(t) is convex, so we use ternary search over t in [q_lo_max, q_max].
+
+        When gamma * R_DP == 0, this reduces to the original solver with no
+        ||q||_inf term.
 
         Args:
             all_losses: (m+n,) tensor of per-sample losses, indexed 0..m+n-1.
+            r_dp_value: scalar — R_DP(h) (weight-decay regularizer), precomputed.
         """
         cfg = self.algo_config.bea
         m, n = self.m, self.n
         total = m + n
 
         c = all_losses.clone()
-        c[:m] += cfg.lambda_d * self.d[:m]
+        c[:m] += cfg.d.lambda_d * self.d[:m]
+
+        # The paper assumes ℓ ∈ [0, 1].  Diffusion MSE losses are unbounded,
+        # so normalize the cost vector to [0, 1] to preserve the intended
+        # balance between the loss term and the λ₁/λ₂ regularizers.
+        c_max = c.max().clamp(min=1e-8)
+        if c_max > 1.0:
+            c = c / c_max
 
         p0 = self.p0
         lam1 = cfg.lambda_1
         lam2 = cfg.lambda_2
-        q_max = cfg.q_max
+        q_max_cfg = cfg.q.max
 
         q_lo = torch.zeros(total, dtype=torch.float32)
-        if cfg.target_q_min > 0 and n > 0:
-            q_lo[m:] = cfg.target_q_min
-        q_hi = torch.full((total,), q_max, dtype=torch.float32)
+        if cfg.q.target_min > 0 and n > 0:
+            q_lo[m:] = cfg.q.target_min
 
-        def _solve_per_element(mu):
+        gamma = self._get_gamma()
+        gamma_r = gamma * r_dp_value
+
+        def _solve_per_element(mu, q_hi):
             """Closed-form for  min (c_i-mu)*q_i + lam1*|q_i-p0_i| + lam2*q_i^2."""
             eff = c - mu
             residual = eff + 2.0 * lam2 * p0
@@ -426,38 +506,99 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
             )
             return torch.clamp(q_star, min=q_lo, max=q_hi)
 
-        if not cfg.sum_constraint_enabled:
-            self.q = _solve_per_element(0.0)
+        def _separable_obj(q_vec):
+            """Evaluate the separable part: sum c_i*q_i + lam1*|q_i-p0_i| + lam2*q_i^2."""
+            return (
+                (c * q_vec).sum()
+                + lam1 * (q_vec - p0).abs().sum()
+                + lam2 * q_vec.pow(2).sum()
+            ).item()
+
+        def _solve_inner(t):
+            """Solve the separable inner problem for a given t (upper bound on q_i).
+
+            Returns (q_solution, separable_objective_value).
+            """
+            q_hi = torch.full((total,), min(q_max_cfg, t), dtype=torch.float32)
+            q_hi = torch.max(q_hi, q_lo)
+
+            if not cfg.q.sum_constraint_enabled:
+                q_sol = _solve_per_element(0.0, q_hi)
+                return q_sol, _separable_obj(q_sol)
+
+            target_sum = float(n) + cfg.q.sum_constraint_alpha * float(m)
+
+            mu_lo = float(c.min()) - lam1 - 2.0 * lam2 * q_max_cfg - 1.0
+            mu_hi = float(c.max()) + lam1 + 1.0
+            for _ in range(20):
+                if _solve_per_element(mu_lo, q_hi).sum().item() >= target_sum:
+                    mu_lo -= abs(mu_lo) + 10.0
+                else:
+                    break
+            for _ in range(20):
+                if _solve_per_element(mu_hi, q_hi).sum().item() <= target_sum:
+                    mu_hi += abs(mu_hi) + 10.0
+                else:
+                    break
+
+            for _ in range(100):
+                mu_mid = (mu_lo + mu_hi) / 2.0
+                q_mid = _solve_per_element(mu_mid, q_hi)
+                s = q_mid.sum().item()
+                if abs(s - target_sum) < 1e-6:
+                    break
+                if s < target_sum:
+                    mu_lo = mu_mid
+                else:
+                    mu_hi = mu_mid
+
+            q_sol = _solve_per_element((mu_lo + mu_hi) / 2.0, q_hi)
+            return q_sol, _separable_obj(q_sol)
+
+        print(
+            f"[BEA] solve_q_global: c_norm range=[{c.min():.4f}, {c.max():.4f}], "
+            f"lam1={lam1}, lam2={lam2}, p0_src={p0[:m].mean():.4f}, "
+            f"p0_tgt={p0[m:].mean():.4f}, gamma_r={gamma_r:.4f}"
+        )
+
+        if gamma_r <= 0:
+            q_hi = torch.full((total,), q_max_cfg, dtype=torch.float32)
+            if not cfg.q.sum_constraint_enabled:
+                self.q = _solve_per_element(0.0, q_hi)
+            else:
+                q_sol, _ = _solve_inner(q_max_cfg)
+                self.q = q_sol
             return
 
-        target_sum = float(n) + cfg.sum_constraint_alpha * float(m)
+        # With gamma_r > 0: search over t = ||q||_inf.
+        # F(t) = inner_obj(t) + gamma_r * t is convex → ternary search.
+        t_lo = q_lo.max().item()
+        t_hi = q_max_cfg
 
-        # Initial bracket: sum(q) is non-decreasing in mu.
-        mu_lo = float(c.min()) - lam1 - 2.0 * lam2 * q_max - 1.0
-        mu_hi = float(c.max()) + lam1 + 1.0
-        for _ in range(20):
-            if _solve_per_element(mu_lo).sum().item() >= target_sum:
-                mu_lo -= abs(mu_lo) + 10.0
-            else:
-                break
-        for _ in range(20):
-            if _solve_per_element(mu_hi).sum().item() <= target_sum:
-                mu_hi += abs(mu_hi) + 10.0
-            else:
-                break
+        # When the sum constraint is active, t must be large enough that
+        # sum_i min(q_max, t) >= target_sum, otherwise the inner problem
+        # is infeasible.  The tightest simple bound is t >= target_sum / total.
+        if cfg.q.sum_constraint_enabled:
+            target_sum = float(n) + cfg.q.sum_constraint_alpha * float(m)
+            t_lo = max(t_lo, target_sum / float(total))
 
-        for _ in range(100):
-            mu_mid = (mu_lo + mu_hi) / 2.0
-            q_mid = _solve_per_element(mu_mid)
-            s = q_mid.sum().item()
-            if abs(s - target_sum) < 1e-6:
-                break
-            if s < target_sum:
-                mu_lo = mu_mid
-            else:
-                mu_hi = mu_mid
+        def _total_obj(t):
+            _, sep_val = _solve_inner(t)
+            return sep_val + gamma_r * t
 
-        self.q = _solve_per_element((mu_lo + mu_hi) / 2.0)
+        for _ in range(80):
+            if t_hi - t_lo < 1e-7:
+                break
+            m1 = t_lo + (t_hi - t_lo) / 3.0
+            m2 = t_hi - (t_hi - t_lo) / 3.0
+            if _total_obj(m1) < _total_obj(m2):
+                t_hi = m2
+            else:
+                t_lo = m1
+
+        t_opt = (t_lo + t_hi) / 2.0
+        q_sol, _ = _solve_inner(t_opt)
+        self.q = q_sol
 
     #### q-weighted training step  --------------------------------------------------------------------------------
 
@@ -579,6 +720,4 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
             self.m = bea["m"]
             self.n = bea["n"]
             self.loss_ema = bea.get("loss_ema", None)
-            self._bea_initialized = True
-
             self._bea_initialized = True
