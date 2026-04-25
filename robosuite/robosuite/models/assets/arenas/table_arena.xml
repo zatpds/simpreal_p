@@ -4,8 +4,8 @@
     <texture file="../textures/light-gray-floor-tile.png" type="2d" name="texplane"/>
     <material name="floorplane" reflectance="0.01" shininess="0.0" specular="0.0" texrepeat="2 2" texture="texplane" texuniform="true"/>
     <!-- ceramic table texture and material-->
-    <!--<texture file="../textures/wood-varnished-panels.png" type="cube" name="tex-ceramic"/>-->
     <texture file="../textures/ceramic.png" type="cube" name="tex-ceramic"/>
+    <!--<texture file="../textures/wood-varnished-panels.png" type="cube" name="tex-ceramic"/>-->
     <material name="table_ceramic" reflectance="0.0" shininess="0.0" specular="0.2" texrepeat="1 1" texture="tex-ceramic" />
     <!-- steel legs -->
     <texture file="../textures/steel-brushed.png" type="cube" name="tex-steel-brushed"/>

@@ -14,3 +14,4 @@ from robomimic.config.diffusion_policy_config import DiffusionPolicyConfig
 from robomimic.config.diffusion_policy_ot_config import OTDiffusionPolicyConfig
 from robomimic.config.diffusion_policy_bea_config import BEADiffusionPolicyConfig
 from robomimic.config.diffusion_policy_mmd_config import MMDDiffusionPolicyConfig
+from robomimic.config.diffusion_policy_msbea_config import MSBEADiffusionPolicyConfig
