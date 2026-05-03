@@ -106,3 +106,19 @@ class SingleArmEnv_MG(SingleArmEnv):
             pos=string_to_array("0.753078462147161 2.062036796036723e-08 1.5194726087166726"),
             quat=string_to_array("0.6432409286499023 0.293668270111084 0.2936684489250183 0.6432408690452576"),
         )
+
+    def _add_agentview45_full_camera(self, arena):
+        """
+        Add 45-degree counterpart of ``agentview_full``.
+
+        Same xy-radius (~0.753 m) and height (~1.52 m) as ``agentview_full``,
+        rotated 45 degrees about the table center (world z-axis). This keeps
+        the pulled-back tabletop framing consistent between the front view
+        and the 45-degree view (parallel to how stock robosuite relates
+        ``agentview`` and ``agentview45``).
+        """
+        arena.set_camera(
+            camera_name="agentview45_full",
+            pos=string_to_array("0.5325068727689923 0.5325069019305962 1.5194726087166726"),
+            quat=string_to_array("0.3481195190066845 0.1589320605550740 0.3836962664930431 0.8404347539777092"),
+        )

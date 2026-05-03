@@ -257,6 +257,30 @@ class Threading(SingleArmEnv_MG):
         # Add camera with full tabletop perspective
         self._add_agentview_full_camera(mujoco_arena)
 
+        # Move the default `agentview45` camera to the symmetric -y corner
+        # so it sits on the -y side of the table instead of +y. In the D0
+        # layout the robot arm approaches the needle from the +y side and
+        # occludes the tripod's ring hole from the stock +y-side
+        # agentview45; the -y corner gives an unoccluded side view of the
+        # insertion without changing any task physics. Override is
+        # Threading-only (other envs keep the standard agentview45).
+        #
+        # Quaternion computed by a proper right-handed look-at at the
+        # table center (0, 0, 0.8) with world_up = +z. Simply negating
+        # quaternion components to "mirror" would flip chirality and
+        # render the image upside-down; we use the look-at rotation
+        # instead so that world +z still maps to up in the image.
+        #
+        # Stock  : pos = (0.353553,  0.353553, 1.35),
+        #          quat = (0.356937, 0.137994, 0.333148, 0.861723)
+        # Mirrored: pos = (0.353553, -0.353553, 1.35),
+        #          quat = (0.861723, 0.333148, 0.137994, 0.356937)
+        mujoco_arena.set_camera(
+            camera_name="agentview45",
+            pos=np.array([0.353553, -0.353553, 1.350000]),
+            quat=np.array([0.861723, 0.333148, 0.137994, 0.356937]),
+        )
+
         # initialize objects of interest
         # self.needle = NeedleObject(name="needle")
         # self.tripod = RingTripodObject(name="tripod")
@@ -573,3 +597,34 @@ class Threading_D2(Threading_D1):
                 reference=self.table_offset,
             ),
         )
+
+
+import xml.etree.ElementTree as ET
+
+_WOOD_TEXTURE_FILE = "wood-varnished-panels.png"
+
+
+class ThreadingWood(Threading):
+    """Threading with a wood table surface instead of ceramic.
+
+    Swaps the ceramic table texture to wood at sim-init time via the
+    edit_model_xml hook, so the shared table_arena.xml on disk does not
+    need to be modified. Lets a Threading (ceramic) and ThreadingWood
+    session run in parallel.
+    """
+
+    def edit_model_xml(self, xml_str):
+        xml_str = super().edit_model_xml(xml_str)
+
+        root = ET.fromstring(xml_str)
+        asset = root.find("asset")
+
+        for tex in asset.findall("texture"):
+            if tex.get("name") != "tex-ceramic":
+                continue
+            fpath = tex.get("file", "")
+            if fpath.endswith("ceramic.png"):
+                tex.set("file", fpath.replace("ceramic.png", _WOOD_TEXTURE_FILE))
+            break
+
+        return ET.tostring(root, encoding="utf8").decode("utf8")

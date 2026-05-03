@@ -70,13 +70,18 @@ def extract_datagen_info_from_trajectory(
 
     all_datagen_infos = []
     traj_len = len(states)
+    # Use action-based replay rather than state-based reset_to(state[t]). When the
+    # robosuite/mujoco version that prepared the source dataset differs from the
+    # current install (gripper geom layout, init_qpos, etc.), state-based replay
+    # may place the robot in a configuration that no longer registers contacts with
+    # the object, leaving subtask_term_signals (e.g. ``grasp``) all zero. Stepping
+    # the recorded actions from the initial state lets the dynamics regenerate
+    # contacts naturally, which restores valid signals.
     for t in range(traj_len):
-        # reset to state
-        env.reset_to({"states" : states[t]})
-
-        # extract datagen info as a dictionary
+        # extract datagen info BEFORE stepping so it reflects the recorded state[t]
         datagen_info = env_interface.get_datagen_info(action=actions[t]).to_dict()
         all_datagen_infos.append(datagen_info)
+        env.step(actions[t])
 
     # convert list of dict to dict of list for datagen info dictionaries (for convenient writes to hdf5 dataset)
     all_datagen_infos = TensorUtils.list_of_flat_dict_to_dict_of_list(all_datagen_infos)

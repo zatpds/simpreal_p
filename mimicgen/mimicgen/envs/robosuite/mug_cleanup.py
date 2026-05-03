@@ -270,8 +270,9 @@ class MugCleanup(SingleArmEnv_MG):
         # Arena always gets set to zero origin
         mujoco_arena.set_origin([0, 0, 0])
 
-        # Add camera with full tabletop perspective
+        # Add cameras with full tabletop perspective (front + 45-degree counterpart)
         self._add_agentview_full_camera(mujoco_arena)
+        self._add_agentview45_full_camera(mujoco_arena)
 
         # Set default agentview camera to be "agentview_full" (and send old agentview camera to agentview_full)
         old_agentview_camera = find_elements(root=mujoco_arena.worldbody, tags="camera", attribs={"name": "agentview"}, return_first=True)
@@ -287,6 +288,23 @@ class MugCleanup(SingleArmEnv_MG):
             camera_name="agentview_full",
             pos=string_to_array(old_agentview_camera_pose[0]),
             quat=string_to_array(old_agentview_camera_pose[1]),
+        )
+
+        # Same swap for the 45-degree pair, so requesting "agentview45" in mug envs
+        # yields a pose consistent with the pulled-back "agentview" above.
+        old_agentview45_camera = find_elements(root=mujoco_arena.worldbody, tags="camera", attribs={"name": "agentview45"}, return_first=True)
+        old_agentview45_camera_pose = (old_agentview45_camera.get("pos"), old_agentview45_camera.get("quat"))
+        old_agentview45_full_camera = find_elements(root=mujoco_arena.worldbody, tags="camera", attribs={"name": "agentview45_full"}, return_first=True)
+        old_agentview45_full_camera_pose = (old_agentview45_full_camera.get("pos"), old_agentview45_full_camera.get("quat"))
+        mujoco_arena.set_camera(
+            camera_name="agentview45",
+            pos=string_to_array(old_agentview45_full_camera_pose[0]),
+            quat=string_to_array(old_agentview45_full_camera_pose[1]),
+        )
+        mujoco_arena.set_camera(
+            camera_name="agentview45_full",
+            pos=string_to_array(old_agentview45_camera_pose[0]),
+            quat=string_to_array(old_agentview45_camera_pose[1]),
         )
 
         # initialize objects of interest
@@ -464,7 +482,7 @@ class MugCleanup(SingleArmEnv_MG):
                     # object is fixture - set pose in model
                     body_id = self.sim.model.body_name2id(obj.root_body)
                     obj_pos_to_set = np.array(obj_pos)
-                    obj_pos_to_set[2] = 0.805 # hardcode z-value to make sure it lies on table surface
+                    obj_pos_to_set[2] = self.table_offset[2] + 0.005 # table surface + small clearance
                     self.sim.model.body_pos[body_id] = obj_pos_to_set
                     self.sim.model.body_quat[body_id] = obj_quat
                 else:
@@ -706,7 +724,16 @@ _WOOD_TEXTURE_FILE = "wood-varnished-panels.png"
 
 
 class MugCleanupWood(MugCleanup):
-    """MugCleanup with a wood table surface instead of ceramic."""
+    """MugCleanup with a wood table surface instead of ceramic.
+
+    Only the arena's table texture (named "tex-ceramic" in
+    robosuite/models/assets/arenas/table_arena.xml) is swapped. We
+    deliberately do NOT touch other textures whose file happens to end
+    in "ceramic.png" (e.g. the drawer's Ceramic CustomMaterial, or the
+    ShapeNet mug's diffuse map at mimicgen/.../textures/ceramic.png),
+    otherwise reset_from_xml_string playback will rewrite them to a
+    non-existent wood file in the wrong assets tree.
+    """
 
     def edit_model_xml(self, xml_str):
         xml_str = super().edit_model_xml(xml_str)
@@ -715,9 +742,11 @@ class MugCleanupWood(MugCleanup):
         asset = root.find("asset")
 
         for tex in asset.findall("texture"):
+            if tex.get("name") != "tex-ceramic":
+                continue
             fpath = tex.get("file", "")
             if fpath.endswith("ceramic.png"):
                 tex.set("file", fpath.replace("ceramic.png", _WOOD_TEXTURE_FILE))
-                break
+            break
 
         return ET.tostring(root, encoding="utf8").decode("utf8")

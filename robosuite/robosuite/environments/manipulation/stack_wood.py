@@ -29,9 +29,11 @@ class StackWood(Stack):
         asset = root.find("asset")
 
         for tex in asset.findall("texture"):
+            if tex.get("name") != "tex-ceramic":
+                continue
             fpath = tex.get("file", "")
             if fpath.endswith("ceramic.png"):
                 tex.set("file", fpath.replace("ceramic.png", WOOD_TEXTURE_FILE))
-                break
+            break
 
         return ET.tostring(root, encoding="utf8").decode("utf8")
