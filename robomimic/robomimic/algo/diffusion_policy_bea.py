@@ -18,11 +18,13 @@ Config layout (under algo.bea):
   d.mode                      — "d_hat", "knn", or "classifier"
   d.k                         — k-NN k (knn mode only)
   d.value                     — constant d (d_hat mode only)
+  d.aggregate                 — "instance" or "domain" (see _aggregate_d)
   d.lambda_d                  — coefficient on discrepancy penalty
   p0_source, p0_target, p0_target_uniform — reference weights
   loss_ema_beta               — EMA smoothing (0 = disabled)
 """
 
+import time
 from collections import OrderedDict
 
 import torch
@@ -126,6 +128,42 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
     #### Dynamic discrepancy (k-NN & classifer) -------------------------------------------------------------------
 
     @torch.no_grad()
+    def _aggregate_d(self):
+        """
+        Apply the d.aggregate setting to the freshly estimated self.d.
+
+        With "domain", every source sample's d_i is replaced by the mean d
+        over its own source domain, so the discrepancy signal survives only
+        at domain granularity while the estimator, its inputs and the rest of
+        the objective are untouched.  With "instance" (default) d is left as
+        estimated.
+
+        Returns:
+            list of per-domain scalars (empty when d is left instance-level).
+        """
+        mode = self.algo_config.bea.d.aggregate
+        assert mode in ("instance", "domain"), (
+            f"unknown algo.bea.d.aggregate '{mode}' (expected 'instance' or 'domain')"
+        )
+        if mode == "instance" or self.m == 0:
+            return []
+
+        d_src = self.d[:self.m]  # view into self.d
+        # MSBEA keeps a domain id per source sample; single-source BEA does not.
+        domain_id = getattr(self, "domain_id", None)
+        if domain_id is None:
+            means = [d_src.mean()]
+            d_src.fill_(means[0])
+        else:
+            means = []
+            for s in range(len(self.source_sizes)):
+                mask = domain_id == s
+                mean_s = d_src[mask].mean()
+                d_src[mask] = mean_s
+                means.append(mean_s)
+        return [v.item() for v in means]
+
+    @torch.no_grad()
     def _extract_obs_embeddings(self, data_loader, obs_normalization_stats=None):
         """
         Single forward pass through the obs encoder to collect (index, embedding)
@@ -162,9 +200,12 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
         cfg = self.algo_config.bea
         k = cfg.d.k
 
+        t0 = time.time()
         indices, embeddings = self._extract_obs_embeddings(
             data_loader, obs_normalization_stats,
         )
+        t_embed = time.time() - t0
+        t0 = time.time()
 
         src_emb = embeddings[:self.m]   # (m, D)
         tgt_emb = embeddings[self.m:]   # (n, D)
@@ -190,12 +231,20 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
         self.d[:self.m] = raw_d
         self.d[self.m:] = 0.0
 
+        # Reported on the instance-level distances in both aggregation modes,
+        # so the two arms of the instance-vs-domain ablation log the same
+        # underlying distance distribution.
         stats = {
-            "d_source_mean": self.d[:self.m].mean().item(),
-            "d_source_std": self.d[:self.m].std().item(),
-            "d_source_min": self.d[:self.m].min().item(),
-            "d_source_max": self.d[:self.m].max().item(),
+            "d_source_mean": raw_d.mean().item(),
+            "d_source_std": raw_d.std().item(),
+            "d_source_min": raw_d.min().item(),
+            "d_source_max": raw_d.max().item(),
             "d_target_ref": tgt_ref.item(),
+            # split the refresh so the encoder pass and the search can be
+            # costed separately when the source pool grows
+            "time_embed_s": t_embed,
+            "time_knn_s": time.time() - t0,
+            "embed_dim": float(embeddings.shape[1]),
         }
         print(
             "[BEA] dynamic d: mean={:.4f}, std={:.4f}, "
@@ -205,6 +254,14 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
                 stats["d_target_ref"],
             )
         )
+
+        domain_d = self._aggregate_d()
+        for s, v in enumerate(domain_d):
+            stats["d_domain_{}".format(s)] = v
+        if domain_d:
+            print("[BEA] domain-level d: {}".format(
+                ", ".join("{:.4f}".format(v) for v in domain_d)
+            ))
         return stats
 
     @torch.no_grad()
@@ -247,6 +304,14 @@ class BEADiffusionPolicyUNet(DiffusionPolicyUNet):
                 stats["d_source_min"], stats["d_source_max"],
             )
         )
+
+        domain_d = self._aggregate_d()
+        for s, v in enumerate(domain_d):
+            stats["d_domain_{}".format(s)] = v
+        if domain_d:
+            print("[BEA] domain-level d: {}".format(
+                ", ".join("{:.4f}".format(v) for v in domain_d)
+            ))
         return stats
 
     #### Batch processing — pass through sample indices ------------------------------------------------------------

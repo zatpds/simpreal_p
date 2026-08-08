@@ -44,6 +44,11 @@ class BEADiffusionPolicyConfig(DiffusionPolicyConfig):
         self.algo.bea.d.k = 3
         # constant discrepancy value (only used when mode="d_hat")
         self.algo.bea.d.value = 1.0
+        # granularity at which the estimated discrepancy enters the q-update
+        # "instance" — per-sample d_i, as estimated (default)
+        # "domain"   — d_i replaced by its mean over the source domain, so
+        #              every source sample carries the same discrepancy
+        self.algo.bea.d.aggregate = "instance"
         # lambda_d: coefficient on discrepancy penalty  sum_i q_i * d_i
         self.algo.bea.d.lambda_d = 0.1
 
